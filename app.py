@@ -11,7 +11,10 @@ from wordcloud import WordCloud
 import matplotlib.font_manager as fm
 import json
 from snownlp import SnowNLP
-from opencc import OpenCC
+from opencc import OpenCC 
+
+# --- 初始化 OpenCC (簡體轉繁體與台灣在地化) ---
+cc = OpenCC('s2twp') 
 
 # --- 1. 網頁全域配置 ---
 st.set_page_config(
@@ -21,7 +24,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 支援深淺色切換的客製化高級感 CSS
 st.markdown("""
     <style>
     .welcome-card {
@@ -77,89 +79,102 @@ def search_videos(query, max_results=5):
     response = request.execute()
     
     results = []
-    # 遍歷回傳的 items，並使用安全的 .get() 方法避免 KeyError
     for item in response.get("items", []):
-        # 嘗試抓取 videoId，如果沒有這個 key 則回傳 None 而不是報錯
         video_id = item.get("id", {}).get("videoId")
-        
-        # 只有在真的有 videoId 的情況下，才加入清單中
         if video_id:
-            results.append({
-                "title": item["snippet"]["title"], 
-                "videoId": video_id
-            })
-            
+            results.append({"title": item["snippet"]["title"], "videoId": video_id})
     return results
+
 def get_comments(video_id, max_results=50):
     youtube = build("youtube", "v3", developerKey=YOUTUBE_API_KEY)
+    comments_data = []
     try:
         request = youtube.commentThreads().list(part="snippet", videoId=video_id, maxResults=max_results, textFormat="plainText")
         response = request.execute()
-        return [item["snippet"]["topLevelComment"]["snippet"]["textDisplay"] for item in response["items"]]
+        
+        # 同時抓取留言內容與發布時間
+        for item in response.get("items", []):
+            snippet = item["snippet"]["topLevelComment"]["snippet"]
+            text = snippet.get("textDisplay", "")
+            # 取出時間字串並只保留 YYYY-MM-DD (例如：2023-10-15)
+            date_str = snippet.get("publishedAt", "").split("T")[0] 
+            if text:
+                comments_data.append({"text": text, "date": date_str})
+                
+        return comments_data
     except:
         return []
-    
-cc = OpenCC('s2twp')
 
-# 【優化 3】降噪與前處理：幫留言減肥
-def preprocess_comments(comments, max_chars=3000):
+def preprocess_comments(comments_data, max_chars=3000):
     seen = set()
     valid_comments = []
     
-    # 1. 簡繁轉換、去除重複洗版與過短廢話
-    for c in comments:
-        # 將每一則留言統一轉換為台灣繁體與慣用語
-        c_clean = cc.convert(c.strip()) 
+    for c in comments_data:
+        # 將每一則留言統一轉換為台灣繁體
+        c_clean = cc.convert(c["text"].strip()) 
         
-        # 剔除小於 5 個字的留言，並過濾重複
         if len(c_clean) >= 5 and c_clean not in seen:
             seen.add(c_clean)
-            valid_comments.append(c_clean)
+            # 保留日期與清理後的文字
+            valid_comments.append({"text": c_clean, "date": c["date"]})
             
-    # 2. 限制總字元數 (避免爆 Token)
     llm_text = ""
     for c in valid_comments:
-        if len(llm_text) + len(c) > max_chars:
+        if len(llm_text) + len(c["text"]) > max_chars:
             break
-        llm_text += c + "\n"
+        llm_text += c["text"] + "\n"
         
     return valid_comments, llm_text
 
-# 【優化 2】本地端情感分析：脫離 LLM，省下海量 Token
-def analyze_sentiment_local(comments):
+def analyze_sentiment_and_trend(valid_comments):
     sentiments = []
-    for c in comments:
+    trend_data = []
+    
+    for c in valid_comments:
+        text = c["text"]
+        date = c["date"]
         try:
-            # SnowNLP 情緒分數落在 0~1 之間，越接近 1 越正向
-            s = SnowNLP(c).sentiments
+            s = SnowNLP(text).sentiments
             if s > 0.65:
-                sentiments.append("正向情緒")
+                label = "正向情緒"
             elif s < 0.35:
-                sentiments.append("負向情緒")
+                label = "負向情緒"
             else:
-                sentiments.append("中立/其他")
+                label = "中立/其他"
         except:
-            sentiments.append("中立/其他")
-    return Counter(sentiments)
+            label = "中立/其他"
+            
+        sentiments.append(label)
+        # 收集時間軸資料
+        trend_data.append({"日期": date, "情緒": label, "數量": 1})
+        
+    # 計算整體圓餅圖比例
+    overall_counts = Counter(sentiments)
+    
+    # 處理時間軸 DataFrame
+    df_trend = pd.DataFrame(trend_data)
+    if not df_trend.empty:
+        # 將相同日期與情緒的數量加總
+        df_trend = df_trend.groupby(["日期", "情緒"]).sum().reset_index()
+        # 依照日期排序，確保折線圖時間連續
+        df_trend = df_trend.sort_values(by="日期")
+        
+    return overall_counts, df_trend
 
-# 【優化 1】合併 API 請求：一次拿完摘要與觀點，並強制要求深度分析
 def get_ai_comprehensive_analysis(text):
     if not text:
         return {"error": "⚠️ 沒有足夠的有效留言可供分析。"}
-    
     try:
         client = Groq(api_key=GROQ_API_KEY)
-        
-        # 重新設計的 Prompt：嚴格要求字數與分析深度，並加入換行符號 (\n\n) 讓排版更美觀
         prompt = f"""
-        你是一位專業的社群媒體輿情分析師。請根據以下 YouTube 留言，進行「深度且詳細」的綜合分析，可對於部分內容列點展示。
+        你是一位專業的社群媒體輿情分析師。請根據以下 YouTube 留言，進行「深度且詳細」的綜合分析。
         請嚴格輸出為 JSON 格式，包含以下兩個 key。
         ⚠️ 重要指示：請勿給出過於簡短的敷衍回應！每個標題下的內容都需要有實質的分析、具體的觀點整理，並使用「繁體中文」與「Markdown 格式」排版。
 
         期望的 JSON 結構與內容深度要求如下：
         {{
-            "summary": "📌 **【事件簡介】**：\\n(請詳細說明這群留言主要在討論什麼核心事件，約 100 字)\\n\\n🔄 **【事件經過與背景】**：\\n(根據留言透露的訊息，詳細整理這個事件的發展脈絡，約 100-150 字)\\n\\n⚡ **【主要爭議點】**：\\n(網友們最在意、爭論最激烈的焦點是什麼？請列出具體細節，約 150 字)",
-            "opinion": "👍 **【支持方論點】**：\\n(贊同、支持的網友，他們的主要理由與邏輯是什麼？請詳細列出，約 150 字)\\n\\n👎 **【反對方論點】**：\\n(質疑、批評的反對意見，他們的核心不滿在哪裡？請詳細列出，約 150 字)\\n\\n🧭 **【整體風向】**：\\n(深入剖析社群上的輿論大方向，例如是一面倒、五五波還是各有堅持，約 100 字)\\n\\n🎭 **【情緒特徵】**：\\n(留言中充斥著什麼樣的情緒？請具體說明，約 100 字)"
+            "summary": "📌 **【事件簡介】**：\\n(請詳細說明討論的核心事件，約 100 字)\\n\\n🔄 **【事件經過與背景】**：\\n(根據留言整理發展脈絡，約 100-150 字)\\n\\n⚡ **【主要爭議點】**：\\n(網友最在意的焦點是什麼？約 150 字)",
+            "opinion": "👍 **【支持方論點】**：\\n(贊同的網友主要理由與邏輯是什麼？約 150 字)\\n\\n👎 **【反對方論點】**：\\n(批評的反對意見核心不滿在哪裡？約 150 字)\\n\\n🧭 **【整體風向】**：\\n(深入剖析輿論大方向，約 100 字)\\n\\n🎭 **【情緒特徵】**：\\n(留言中充斥著什麼樣的情緒？約 100 字)"
         }}
 
         以下為留言內容：
@@ -167,15 +182,14 @@ def get_ai_comprehensive_analysis(text):
         {text}
         \"\"\"
         """
-        
         res = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": "你是一個只會輸出合法 JSON 格式，且擅長進行長篇深度分析的輿情助理。"},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.2, # 稍微調高一點點溫度，讓文字更豐富生動，原本 0.0 會太死板
-            max_tokens=2500, # 將上限從 1500 提高到 2500，確保長篇大論不會被截斷
+            temperature=0.2, 
+            max_tokens=2500,
             response_format={"type": "json_object"} 
         )
         content = res.choices[0].message.content.strip()
@@ -198,16 +212,16 @@ if start_btn and keyword:
         st.error("❌ 請展開左側的「API 金鑰設定」並輸入正確的金鑰！")
         st.stop()
         
-    with st.spinner('🎯 正在擷取資料並進行多維度分析中，請稍候...'):
+    with st.spinner('🎯 正在擷取資料、處理時間軸並進行深度分析中，請稍候...'):
         videos = search_videos(keyword, max_results=search_num)
         all_comments = []
         for v in videos:
+            # 取得的資料現在包含 text 與 date
             all_comments.extend(get_comments(v['videoId']))
         
         if not all_comments:
             st.error("😔 找不到相關留言，或該影片的評論功能已被關閉。")
         else:
-            # 進行資料前處理
             valid_comments, llm_text = preprocess_comments(all_comments)
             
             st.markdown(f"## 📊 輿情分析報告: **{keyword}**")
@@ -222,10 +236,9 @@ if start_btn and keyword:
             
             st.markdown("---")
             
-            # --- 分頁配置 ---
-            tab1, tab2, tab3, tab4 = st.tabs(["📋 AI 文本摘要", "📈 情感分佈", "☁️ 詞雲熱詞", "💬 原始數據"])
+            # 增加了一個「⏳ 時間軸趨勢」的分頁
+            tab1, tab2, tab3, tab4, tab5 = st.tabs(["📋 AI 文本摘要", "📊 情感分佈", "⏳ 時間軸趨勢", "☁️ 詞雲熱詞", "💬 原始數據"])
             
-            # 呼叫大模型 (僅需呼叫一次！)
             ai_result = get_ai_comprehensive_analysis(llm_text)
             
             with tab1:
@@ -245,43 +258,50 @@ if start_btn and keyword:
                         st.markdown(ai_result.get("opinion", "無法解析內容"))
                         st.markdown('</div>', unsafe_allow_html=True)
 
+            # 呼叫重構後的情感分析函式，同時取得圓餅圖與折線圖的資料
+            sentiment_counts, df_trend = analyze_sentiment_and_trend(valid_comments)
+
             with tab2:
-                st.subheader("📊 留言情緒比例分析")
-                # 使用本地端套件分析情緒，零 Token 消耗，且分析數量為「所有有效留言」而非截斷後的留言
-                sentiment_counts = analyze_sentiment_local(valid_comments)
-                
+                st.subheader("📊 留言情緒比例分析 (基於 SnowNLP)")
                 s_df = pd.DataFrame(sentiment_counts.items(), columns=['情緒', '數量'])
-                
-                fig = px.pie(s_df, values='數量', names='情緒', color='情緒',
-                             color_discrete_map={'正向情緒':'#2ecc71', '負向情緒':'#e74c3c', '中立/其他':'#bdc3c7'},
-                             hole=0.4)
+                fig_pie = px.pie(s_df, values='數量', names='情緒', color='情緒',
+                                 color_discrete_map={'正向情緒':'#2ecc71', '負向情緒':'#e74c3c', '中立/其他':'#bdc3c7'},
+                                 hole=0.4)
                 
                 is_dark = st.get_option("theme.base") == "dark"
-                fig.update_layout(
-                    paper_bgcolor='rgba(0,0,0,0)', 
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    font_color="white" if is_dark else "black"
-                )
-                st.plotly_chart(fig, use_container_width=True)
+                fig_pie.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="white" if is_dark else "black")
+                st.plotly_chart(fig_pie, use_container_width=True)
 
             with tab3:
+                st.subheader("📈 每日留言情緒走勢圖")
+                if not df_trend.empty:
+                    # 使用 Plotly 繪製折線圖
+                    fig_trend = px.line(df_trend, x="日期", y="數量", color="情緒", markers=True,
+                                        color_discrete_map={'正向情緒':'#2ecc71', '負向情緒':'#e74c3c', '中立/其他':'#bdc3c7'},
+                                        title="情緒聲量時間軸變化")
+                    
+                    fig_trend.update_layout(
+                        paper_bgcolor='rgba(0,0,0,0)', 
+                        plot_bgcolor='rgba(0,0,0,0)', 
+                        font_color="white" if is_dark else "black",
+                        xaxis_title="日期",
+                        yaxis_title="留言聲量 (則數)"
+                    )
+                    st.plotly_chart(fig_trend, use_container_width=True)
+                else:
+                    st.info("無法繪製趨勢圖：留言時間數據不足。")
+
+            with tab4:
                 st.subheader("☁️ 熱門關鍵字雲")
-                words = jieba.cut(" ".join(valid_comments))
-                
-                # 🛑 大幅擴充停用詞庫（Stopwords）
+                words = jieba.cut(" ".join([c["text"] for c in valid_comments]))
                 stopwords = {
-                    # 單字
                     "的", "是", "我", "了", "啊", "嗎", "吧", "也", "就", "都", "很", "還", "在", "有", "和", "不", "人", "他", "你", "這", "那", 
-                    # 影片相關與常見動詞/形容詞
                     "影片", "留言", "覺得", "真的", "怎麼", "什麼", "看到", "知道", "出來", "認為",
-                    # 常見代名詞、連詞、副詞與無意義口頭禪 (針對詞雲優化)
                     "就是", "我們", "他們", "這個", "可以", "只是", "還是", "那些", "那麼", "因為", "所以", "如果", "但是", 
                     "一樣", "一個", "這樣", "現在", "其實", "自己", "這些", "時候", "沒有", "不是", "不過", "的話", "大家", 
                     "而且", "這麼", "為什麼", "一直", "已經", "可能", "應該", "然後", "哪怕", "哪怕", "哪怕", "甚至", "這種",
                     "那些", "有些", "為何", "到底", "多少", "一些", "很多", "這麼", "這麼", "的話", "不會", "不能", "不要"
                 }
-                
-                # 過濾掉停用詞，並且強制詞長大於 1
                 filtered = [w for w in words if w.strip() not in stopwords and len(w) > 1]
                 
                 if len(filtered) > 0:
@@ -301,17 +321,21 @@ if start_btn and keyword:
                 else:
                     st.info("暫無足夠的關鍵字可以生成詞雲。")
 
-            with tab4:
+            with tab5:
                 st.subheader("💬 擷取之原始留言列表")
-                st.dataframe(pd.DataFrame(all_comments, columns=["留言內容"]), use_container_width=True)
+                # 把 Dict 轉換為適合閱讀的 DataFrame (包含時間)
+                display_df = pd.DataFrame(all_comments)
+                display_df.rename(columns={"date": "發布日期", "text": "留言內容"}, inplace=True)
+                # 重新排列欄位順序，讓日期在前面
+                display_df = display_df[["發布日期", "留言內容"]]
+                st.dataframe(display_df, use_container_width=True)
 
 else:
-    # --- 5. 預設歡迎畫面 ---
     st.markdown("""
         <div class="welcome-card">
             <h1>👋 歡迎使用 AI YouTube 輿情分析系統</h1>
             <p style="font-size: 18px; opacity: 0.9;">
-                本系統結合了 YouTube Data API、SnowNLP 與 Groq Llama3，能高效爬取特定主題的社群留言，並自動產出脈絡摘要、觀點碰撞與情感分佈圖表。
+                本系統結合了 YouTube Data API、SnowNLP 與 Groq Llama3，能高效爬取特定主題的社群留言，並自動產出脈絡摘要、觀點碰撞、情感分佈與動態時間軸趨勢。
             </p>
         </div>
         """, unsafe_allow_html=True)
