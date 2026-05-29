@@ -161,6 +161,60 @@ def analyze_sentiment_and_trend(valid_comments):
         
     return overall_counts, df_trend
 
+def extract_judgment_words(valid_comments):
+    positive_terms = [
+        "支持", "讚", "真香", "舒服", "不錯", "很好", "合理", "值得", "喜歡", "喜愛", "推薦", "厲害",
+        "優秀", "棒", "開心", "滿意", "正確", "精彩", "漂亮", "順眼", "讚賞", "感謝", "安心"
+    ]
+    negative_terms = [
+        "垃圾", "爛", "噁心", "可悲", "失望", "誇張", "離譜", "無聊", "智障", "白癡", "傻", "扯",
+        "不行", "不好", "反對", "不合理", "不值得", "問題", "有問題", "太過分", "過分", "假", "爛透",
+        "糟", "差", "討厭", "生氣", "崩潰", "失控", "荒謬", "惡心"
+    ]
+
+    for term in positive_terms + negative_terms:
+        jieba.add_word(term)
+
+    positive_counter = Counter()
+    negative_counter = Counter()
+    positive_examples = {}
+    negative_examples = {}
+
+    for c in valid_comments:
+        text = c["text"]
+        tokens = [token.strip() for token in jieba.lcut(text) if token.strip()]
+        for token in tokens:
+            if token in positive_terms:
+                positive_counter[token] += 1
+                positive_examples.setdefault(token, text)
+            elif token in negative_terms:
+                negative_counter[token] += 1
+                negative_examples.setdefault(token, text)
+
+    positive_df = pd.DataFrame(
+        [
+            {
+                "詞語": term,
+                "出現次數": count,
+                "留言範例": positive_examples.get(term, ""),
+            }
+            for term, count in positive_counter.most_common(5)
+        ]
+    )
+
+    negative_df = pd.DataFrame(
+        [
+            {
+                "詞語": term,
+                "出現次數": count,
+                "留言範例": negative_examples.get(term, ""),
+            }
+            for term, count in negative_counter.most_common(5)
+        ]
+    )
+
+    return positive_df, negative_df
+
 def get_ai_comprehensive_analysis(text):
     if not text:
         return {"error": "⚠️ 沒有足夠的有效留言可供分析。"}
@@ -260,9 +314,10 @@ if start_btn and keyword:
 
             # 呼叫重構後的情感分析函式，同時取得圓餅圖與折線圖的資料
             sentiment_counts, df_trend = analyze_sentiment_and_trend(valid_comments)
+            positive_df, negative_df = extract_judgment_words(valid_comments)
 
             with tab2:
-                st.subheader("📊 留言情緒比例分析 (基於 SnowNLP)")
+                st.subheader("📊 留言情緒比例分析")
                 s_df = pd.DataFrame(sentiment_counts.items(), columns=['情緒', '數量'])
                 fig_pie = px.pie(s_df, values='數量', names='情緒', color='情緒',
                                  color_discrete_map={'正向情緒':'#2ecc71', '負向情緒':'#e74c3c', '中立/其他':'#bdc3c7'},
@@ -271,6 +326,22 @@ if start_btn and keyword:
                 is_dark = st.get_option("theme.base") == "dark"
                 fig_pie.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="white" if is_dark else "black")
                 st.plotly_chart(fig_pie, use_container_width=True)
+
+                st.markdown("---")
+                st.subheader("📝 正負面斷詞統計表")
+                col_left, col_right = st.columns(2)
+                with col_left:
+                    st.markdown("#### 正面詞 Top 5")
+                    if not positive_df.empty:
+                        st.dataframe(positive_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("目前沒有抓到正面詞彙。")
+                with col_right:
+                    st.markdown("#### 負面詞 Top 5")
+                    if not negative_df.empty:
+                        st.dataframe(negative_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("目前沒有抓到負面詞彙。")
 
             with tab3:
                 st.subheader("📈 每日留言情緒走勢圖")
@@ -300,7 +371,7 @@ if start_btn and keyword:
                     "就是", "我們", "他們", "這個", "可以", "只是", "還是", "那些", "那麼", "因為", "所以", "如果", "但是", 
                     "一樣", "一個", "這樣", "現在", "其實", "自己", "這些", "時候", "沒有", "不是", "不過", "的話", "大家", 
                     "而且", "這麼", "為什麼", "一直", "已經", "可能", "應該", "然後", "哪怕", "哪怕", "哪怕", "甚至", "這種",
-                    "那些", "有些", "為何", "到底", "多少", "一些", "很多", "這麼", "這麼", "的話", "不會", "不能", "不要"
+                    "那些", "有些", "為何", "到底", "多少", "一些", "很多", "這麼", "這麼", "的話", "不會", "不能", "不要", "完全", "https"
                 }
                 filtered = [w for w in words if w.strip() not in stopwords and len(w) > 1]
                 
