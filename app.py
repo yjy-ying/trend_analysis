@@ -116,6 +116,8 @@ def get_comments(video_id, max_results=50):
     except:
         return []
 
+import random # 👉 新增這行匯入隨機套件
+
 def preprocess_comments(comments_data, max_chars=3000):
     seen = set()
     valid_comments = []
@@ -129,8 +131,11 @@ def preprocess_comments(comments_data, max_chars=3000):
             # 保留日期與清理後的文字
             valid_comments.append({"text": c_clean, "date": c["date"]})
             
+    # --- ✨ 關鍵修正：將留言順序打亂，確保抽樣平均來自各影片 ---
+    shuffled_comments = random.sample(valid_comments, len(valid_comments))
+    
     llm_text = ""
-    for c in valid_comments:
+    for c in shuffled_comments: # 👉 改從洗牌後的清單來抓取
         if len(llm_text) + len(c["text"]) > max_chars:
             break
         llm_text += c["text"] + "\n"
