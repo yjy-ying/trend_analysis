@@ -10,11 +10,22 @@ import jieba
 from wordcloud import WordCloud
 import matplotlib.font_manager as fm
 import json
-from snownlp import SnowNLP
+from transformers import pipeline
 from opencc import OpenCC 
 
 # --- 初始化 OpenCC (簡體轉繁體與台灣在地化) ---
 cc = OpenCC('s2twp') 
+
+# --- 載入 Hugging Face 情感分析模型 (加上快取，避免每次重整都重新載入) ---
+@st.cache_resource
+def load_sentiment_model():
+    return pipeline(
+        "sentiment-analysis",
+        model="tabularisai/multilingual-sentiment-analysis",
+        device=-1 # 使用 CPU 進行推論
+    )
+
+sentiment_model = load_sentiment_model()
 
 # --- 1. 網頁全域配置 ---
 st.set_page_config(
@@ -96,7 +107,7 @@ def get_comments(video_id, max_results=50):
         for item in response.get("items", []):
             snippet = item["snippet"]["topLevelComment"]["snippet"]
             text = snippet.get("textDisplay", "")
-            # 取出時間字串並只保留 YYYY-MM-DD (例如：2023-10-15)
+            # 取出時間字串並只保留 YYYY-MM-DD
             date_str = snippet.get("publishedAt", "").split("T")[0] 
             if text:
                 comments_data.append({"text": text, "date": date_str})
@@ -126,94 +137,68 @@ def preprocess_comments(comments_data, max_chars=3000):
         
     return valid_comments, llm_text
 
-def analyze_sentiment_and_trend(valid_comments):
+def bert_sentiment(text):
+    try:
+        # 限制長度避免 BERT 報錯
+        result = sentiment_model(text[:512])[0]
+        label = result["label"].lower()
+        score = float(result["score"])
+
+        if "positive" in label:
+            return "正向情緒", score
+        elif "negative" in label:
+            return "負向情緒", score
+        else:
+            return "中立/其他", score
+    except:
+        return "中立/其他", 0.5
+
+# （將原本的 analyze_sentiment_and_trend 與 extract_representative_comments 刪除）
+# （用下面這個合併優化版的 analyze_all_sentiment_data 取代，讓 BERT 只需算一次！）
+def analyze_all_sentiment_data(valid_comments):
     sentiments = []
     trend_data = []
+    rows = []
     
     for c in valid_comments:
         text = c["text"]
         date = c["date"]
-        try:
-            s = SnowNLP(text).sentiments
-            if s > 0.65:
-                label = "正向情緒"
-            elif s < 0.35:
-                label = "負向情緒"
-            else:
-                label = "中立/其他"
-        except:
-            label = "中立/其他"
+        
+        # BERT 模型推論 (每則留言只做一次，大幅節省時間)
+        label, score = bert_sentiment(text)
             
         sentiments.append(label)
-        # 收集時間軸資料
         trend_data.append({"日期": date, "情緒": label, "數量": 1})
+        rows.append({
+            "留言範例": text,
+            "模型信心": round(score * 100, 2),
+            "情感標籤": label
+        })
         
-    # 計算整體圓餅圖比例
+    # 1. 整理圓餅圖資料
     overall_counts = Counter(sentiments)
     
-    # 處理時間軸 DataFrame
+    # 2. 整理趨勢圖資料
     df_trend = pd.DataFrame(trend_data)
     if not df_trend.empty:
-        # 將相同日期與情緒的數量加總
         df_trend = df_trend.groupby(["日期", "情緒"]).sum().reset_index()
-        # 依照日期排序，確保折線圖時間連續
         df_trend = df_trend.sort_values(by="日期")
         
-    return overall_counts, df_trend
+    # 3. 整理 Top 5 正反面留言 (加入 70% 信心度門檻)
+    df_all = pd.DataFrame(rows)
+    positive_df = pd.DataFrame()
+    negative_df = pd.DataFrame()
 
-def extract_judgment_words(valid_comments):
-    positive_terms = [
-        "支持", "讚", "真香", "舒服", "不錯", "很好", "合理", "值得", "喜歡", "喜愛", "推薦", "厲害",
-        "優秀", "棒", "開心", "滿意", "正確", "精彩", "漂亮", "順眼", "讚賞", "感謝", "安心"
-    ]
-    negative_terms = [
-        "垃圾", "爛", "噁心", "可悲", "失望", "誇張", "離譜", "無聊", "智障", "白癡", "傻", "扯",
-        "不行", "不好", "反對", "不合理", "不值得", "問題", "有問題", "太過分", "過分", "假", "爛透",
-        "糟", "差", "討厭", "生氣", "崩潰", "失控", "荒謬", "惡心"
-    ]
+    if not df_all.empty:
+        positive_df = df_all[
+            (df_all["情感標籤"] == "正向情緒") & (df_all["模型信心"] > 70.0)
+        ].sort_values(by="模型信心", ascending=False).head(5).reset_index(drop=True)
+        
+        negative_df = df_all[
+            (df_all["情感標籤"] == "負向情緒") & (df_all["模型信心"] > 70.0)
+        ].sort_values(by="模型信心", ascending=False).head(5).reset_index(drop=True)
 
-    for term in positive_terms + negative_terms:
-        jieba.add_word(term)
-
-    positive_counter = Counter()
-    negative_counter = Counter()
-    positive_examples = {}
-    negative_examples = {}
-
-    for c in valid_comments:
-        text = c["text"]
-        tokens = [token.strip() for token in jieba.lcut(text) if token.strip()]
-        for token in tokens:
-            if token in positive_terms:
-                positive_counter[token] += 1
-                positive_examples.setdefault(token, text)
-            elif token in negative_terms:
-                negative_counter[token] += 1
-                negative_examples.setdefault(token, text)
-
-    positive_df = pd.DataFrame(
-        [
-            {
-                "詞語": term,
-                "出現次數": count,
-                "留言範例": positive_examples.get(term, ""),
-            }
-            for term, count in positive_counter.most_common(5)
-        ]
-    )
-
-    negative_df = pd.DataFrame(
-        [
-            {
-                "詞語": term,
-                "出現次數": count,
-                "留言範例": negative_examples.get(term, ""),
-            }
-            for term, count in negative_counter.most_common(5)
-        ]
-    )
-
-    return positive_df, negative_df
+    return overall_counts, df_trend, positive_df, negative_df
 
 def get_ai_comprehensive_analysis(text):
     if not text:
@@ -228,7 +213,7 @@ def get_ai_comprehensive_analysis(text):
         期望的 JSON 結構與內容深度要求如下：
         {{
             "summary": "📌 **【事件簡介】**：\\n(請詳細說明討論的核心事件，約 100 字)\\n\\n🔄 **【事件經過與背景】**：\\n(根據留言整理發展脈絡，約 100-150 字)\\n\\n⚡ **【主要爭議點】**：\\n(網友最在意的焦點是什麼？約 150 字)",
-            "opinion": "👍 **【支持方論點】**：\\n(贊同的網友主要理由與邏輯是什麼？約 150 字)\\n\\n👎 **【反對方論點】**：\\n(批評的反對意見核心不滿在哪裡？約 150 字)\\n\\n🧭 **【整體風向】**：\\n(深入剖析輿論大方向，約 100 字)\\n\\n🎭 **【情緒特徵】**：\\n(留言中充斥著什麼樣的情緒？約 100 字)"
+            "opinion": "👍 **【支持方論點】**：\\n(贊同的網友主要理由與邏輯是什麼？約 200 字)\\n\\n👎 **【反對方論點】**：\\n(批評的反對意見核心不滿在哪裡？約 200 字)\\n\\n🧭 **【整體風向】**：\\n(深入剖析輿論大方向，約 150 字)\\n\\n🎭 **【情緒特徵】**：\\n(留言中充斥著什麼樣的情緒？約 100 字)"
         }}
 
         以下為留言內容：
@@ -261,152 +246,150 @@ def get_windows_font():
     return None
 
 # --- 4. 主畫面邏輯 (Main Content) ---
-if start_btn and keyword:
-    if not YOUTUBE_API_KEY or not GROQ_API_KEY:
+
+# 改用單純的 if start_btn，讓缺少條件時可以跳出警告，而不是沒反應
+if start_btn:
+    if not keyword:
+        st.warning("⚠️ 請先在左側控制面板輸入「關鍵字」再開始分析！")
+    elif not YOUTUBE_API_KEY or not GROQ_API_KEY:
         st.error("❌ 請展開左側的「API 金鑰設定」並輸入正確的金鑰！")
-        st.stop()
-        
-    with st.spinner('🎯 正在擷取資料、處理時間軸並進行深度分析中，請稍候...'):
-        videos = search_videos(keyword, max_results=search_num)
-        all_comments = []
-        for v in videos:
-            # 取得的資料現在包含 text 與 date
-            all_comments.extend(get_comments(v['videoId']))
-        
-        if not all_comments:
-            st.error("😔 找不到相關留言，或該影片的評論功能已被關閉。")
-        else:
-            valid_comments, llm_text = preprocess_comments(all_comments)
+    else:
+        with st.spinner('🎯 正在擷取資料、推論模型並進行深度分析中，這可能需要一點時間...'):
+            videos = search_videos(keyword, max_results=search_num)
+            all_comments = []
+            for v in videos:
+                all_comments.extend(get_comments(v['videoId']))
             
-            st.markdown(f"## 📊 輿情分析報告: **{keyword}**")
-            
-            m1, m2, m3 = st.columns(3)
-            with m1:
-                st.metric(label="🎬 觀測影片", value=f"{len(videos)} 部")
-            with m2:
-                st.metric(label="💬 原始擷取留言", value=f"{len(all_comments)} 則")
-            with m3:
-                st.metric(label="✨ 過濾後有效留言", value=f"{len(valid_comments)} 則", help="已過濾重複與過短的無意義留言")
-            
-            st.markdown("---")
-            
-            # 增加了一個「⏳ 時間軸趨勢」的分頁
-            tab1, tab2, tab3, tab4, tab5 = st.tabs(["📋 AI 文本摘要", "📊 情感分佈", "⏳ 時間軸趨勢", "☁️ 詞雲熱詞", "💬 原始數據"])
-            
-            ai_result = get_ai_comprehensive_analysis(llm_text)
-            
-            with tab1:
-                if "error" in ai_result:
-                    st.error(ai_result["error"])
-                else:
-                    col_s1, col_s2 = st.columns(2)
-                    with col_s1:
-                        st.markdown('<div class="report-card">', unsafe_allow_html=True)
-                        st.subheader("📝 事件背景與核心脈絡")
-                        st.markdown(ai_result.get("summary", "無法解析內容"))
-                        st.markdown('</div>', unsafe_allow_html=True)
-                    
-                    with col_s2:
-                        st.markdown('<div class="report-card">', unsafe_allow_html=True)
-                        st.subheader("⚖️ 網友正反觀點碰撞")
-                        st.markdown(ai_result.get("opinion", "無法解析內容"))
-                        st.markdown('</div>', unsafe_allow_html=True)
-
-            # 呼叫重構後的情感分析函式，同時取得圓餅圖與折線圖的資料
-            sentiment_counts, df_trend = analyze_sentiment_and_trend(valid_comments)
-            positive_df, negative_df = extract_judgment_words(valid_comments)
-
-            with tab2:
-                st.subheader("📊 留言情緒比例分析")
-                s_df = pd.DataFrame(sentiment_counts.items(), columns=['情緒', '數量'])
-                fig_pie = px.pie(s_df, values='數量', names='情緒', color='情緒',
-                                 color_discrete_map={'正向情緒':'#2ecc71', '負向情緒':'#e74c3c', '中立/其他':'#bdc3c7'},
-                                 hole=0.4)
+            if not all_comments:
+                st.error("😔 找不到相關留言，或該影片的評論功能已被關閉。")
+            else:
+                valid_comments, llm_text = preprocess_comments(all_comments)
                 
-                is_dark = st.get_option("theme.base") == "dark"
-                fig_pie.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="white" if is_dark else "black")
-                st.plotly_chart(fig_pie, use_container_width=True)
-
+                st.markdown(f"## 📊 輿情分析報告: **{keyword}**")
+                
+                m1, m2, m3 = st.columns(3)
+                with m1:
+                    st.metric(label="🎬 觀測影片", value=f"{len(videos)} 部")
+                with m2:
+                    st.metric(label="💬 原始擷取留言", value=f"{len(all_comments)} 則")
+                with m3:
+                    st.metric(label="✨ 過濾後有效留言", value=f"{len(valid_comments)} 則", help="已過濾重複與過短的無意義留言")
+                
                 st.markdown("---")
-                st.subheader("📝 正負面斷詞統計表")
-                col_left, col_right = st.columns(2)
-                with col_left:
-                    st.markdown("#### 正面詞 Top 5")
-                    if not positive_df.empty:
-                        st.dataframe(positive_df, use_container_width=True, hide_index=True)
-                    else:
-                        st.info("目前沒有抓到正面詞彙。")
-                with col_right:
-                    st.markdown("#### 負面詞 Top 5")
-                    if not negative_df.empty:
-                        st.dataframe(negative_df, use_container_width=True, hide_index=True)
-                    else:
-                        st.info("目前沒有抓到負面詞彙。")
-
-            with tab3:
-                st.subheader("📈 每日留言情緒走勢圖")
-                if not df_trend.empty:
-                    # 使用 Plotly 繪製折線圖
-                    fig_trend = px.line(df_trend, x="日期", y="數量", color="情緒", markers=True,
-                                        color_discrete_map={'正向情緒':'#2ecc71', '負向情緒':'#e74c3c', '中立/其他':'#bdc3c7'},
-                                        title="情緒聲量時間軸變化")
-                    
-                    fig_trend.update_layout(
-                        paper_bgcolor='rgba(0,0,0,0)', 
-                        plot_bgcolor='rgba(0,0,0,0)', 
-                        font_color="white" if is_dark else "black",
-                        xaxis_title="日期",
-                        yaxis_title="留言聲量 (則數)"
-                    )
-                    st.plotly_chart(fig_trend, use_container_width=True)
-                else:
-                    st.info("無法繪製趨勢圖：留言時間數據不足。")
-
-            with tab4:
-                st.subheader("☁️ 熱門關鍵字雲")
-                words = jieba.cut(" ".join([c["text"] for c in valid_comments]))
-                stopwords = {
-                    "的", "是", "我", "了", "啊", "嗎", "吧", "也", "就", "都", "很", "還", "在", "有", "和", "不", "人", "他", "你", "這", "那", 
-                    "影片", "留言", "覺得", "真的", "怎麼", "什麼", "看到", "知道", "出來", "認為",
-                    "就是", "我們", "他們", "這個", "可以", "只是", "還是", "那些", "那麼", "因為", "所以", "如果", "但是", 
-                    "一樣", "一個", "這樣", "現在", "其實", "自己", "這些", "時候", "沒有", "不是", "不過", "的話", "大家", 
-                    "而且", "這麼", "為什麼", "一直", "已經", "可能", "應該", "然後", "哪怕", "哪怕", "哪怕", "甚至", "這種",
-                    "那些", "有些", "為何", "到底", "多少", "一些", "很多", "這麼", "這麼", "的話", "不會", "不能", "不要", "完全", "https"
-                }
-                filtered = [w for w in words if w.strip() not in stopwords and len(w) > 1]
                 
-                if len(filtered) > 0:
-                    font_p = get_windows_font()
-                    try:
-                        bg_color = "#1e1e1e" if st.get_option("theme.base") == "dark" else "white"
-                        wc_args = {"background_color": bg_color, "width": 1000, "height": 450}
-                        if font_p: wc_args["font_path"] = font_p
-                            
-                        wc = WordCloud(**wc_args).generate(" ".join(filtered))
-                        fig_wc, ax = plt.subplots(figsize=(10, 4.5), facecolor=bg_color)
-                        ax.imshow(wc, interpolation='bilinear')
-                        ax.axis("off")
-                        st.pyplot(fig_wc)
-                    except:
-                        st.info("💡 詞雲生成發生字體相容性錯誤。")
-                else:
-                    st.info("暫無足夠的關鍵字可以生成詞雲。")
+                tab1, tab2, tab3, tab4, tab5 = st.tabs(["📋 AI 文本摘要", "📊 情感分佈", "⏳ 時間軸趨勢", "☁️ 詞雲熱詞", "💬 原始數據"])
+                
+                ai_result = get_ai_comprehensive_analysis(llm_text)
+                
+                with tab1:
+                    if "error" in ai_result:
+                        st.error(ai_result["error"])
+                    else:
+                        col_s1, col_s2 = st.columns(2)
+                        with col_s1:
+                            st.markdown('<div class="report-card">', unsafe_allow_html=True)
+                            st.subheader("📝 事件背景與核心脈絡")
+                            st.markdown(ai_result.get("summary", "無法解析內容"))
+                            st.markdown('</div>', unsafe_allow_html=True)
+                        
+                        with col_s2:
+                            st.markdown('<div class="report-card">', unsafe_allow_html=True)
+                            st.subheader("⚖️ 網友正反觀點碰撞")
+                            st.markdown(ai_result.get("opinion", "無法解析內容"))
+                            st.markdown('</div>', unsafe_allow_html=True)
 
-            with tab5:
-                st.subheader("💬 擷取之原始留言列表")
-                # 把 Dict 轉換為適合閱讀的 DataFrame (包含時間)
-                display_df = pd.DataFrame(all_comments)
-                display_df.rename(columns={"date": "發布日期", "text": "留言內容"}, inplace=True)
-                # 重新排列欄位順序，讓日期在前面
-                display_df = display_df[["發布日期", "留言內容"]]
-                st.dataframe(display_df, use_container_width=True)
+                # 呼叫合併優化後的情感分析函式，一次拿回四個資料！
+                sentiment_counts, df_trend, positive_df, negative_df = analyze_all_sentiment_data(valid_comments)
 
+                with tab2:
+                    st.subheader("📊 留言情緒比例分析")
+                    s_df = pd.DataFrame(sentiment_counts.items(), columns=['情緒', '數量'])
+                    fig_pie = px.pie(s_df, values='數量', names='情緒', color='情緒',
+                                     color_discrete_map={'正向情緒':'#2ecc71', '負向情緒':'#e74c3c', '中立/其他':'#bdc3c7'},
+                                     hole=0.4)
+                    
+                    is_dark = st.get_option("theme.base") == "dark"
+                    fig_pie.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', font_color="white" if is_dark else "black")
+                    st.plotly_chart(fig_pie, use_container_width=True)
+
+                    st.markdown("---")
+                    st.subheader("📝 正負面代表性留言 (Top 5，信心度 > 70%)")
+                    col_left, col_right = st.columns(2)
+                    with col_left:
+                        st.markdown("#### ✅ 正向留言")
+                        if not positive_df.empty:
+                            st.dataframe(positive_df, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("目前沒有抓到信心度大於 70% 的正面留言。")
+                    with col_right:
+                        st.markdown("#### ❌ 負向留言")
+                        if not negative_df.empty:
+                            st.dataframe(negative_df, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("目前沒有抓到信心度大於 70% 的負面留言。")
+
+                with tab3:
+                    st.subheader("📈 每日留言情緒走勢圖")
+                    if not df_trend.empty:
+                        fig_trend = px.line(df_trend, x="日期", y="數量", color="情緒", markers=True,
+                                            color_discrete_map={'正向情緒':'#2ecc71', '負向情緒':'#e74c3c', '中立/其他':'#bdc3c7'},
+                                            title="情緒聲量時間軸變化")
+                        
+                        fig_trend.update_layout(
+                            paper_bgcolor='rgba(0,0,0,0)', 
+                            plot_bgcolor='rgba(0,0,0,0)', 
+                            font_color="white" if is_dark else "black",
+                            xaxis_title="日期",
+                            yaxis_title="留言聲量 (則數)"
+                        )
+                        st.plotly_chart(fig_trend, use_container_width=True)
+                    else:
+                        st.info("無法繪製趨勢圖：留言時間數據不足。")
+
+                with tab4:
+                    st.subheader("☁️ 熱門關鍵字雲")
+                    words = jieba.cut(" ".join([c["text"] for c in valid_comments]))
+                    stopwords = {
+                        "的", "是", "我", "了", "啊", "嗎", "吧", "也", "就", "都", "很", "還", "在", "有", "和", "不", "人", "他", "你", "這", "那", 
+                        "影片", "留言", "覺得", "真的", "怎麼", "什麼", "看到", "知道", "出來", "認為",
+                        "就是", "我們", "他們", "這個", "可以", "只是", "還是", "那些", "那麼", "因為", "所以", "如果", "但是", 
+                        "一樣", "一個", "這樣", "現在", "其實", "自己", "這些", "時候", "沒有", "不是", "不過", "的話", "大家", 
+                        "而且", "這麼", "為什麼", "一直", "已經", "可能", "應該", "然後", "哪怕", "哪怕", "哪怕", "甚至", "這種",
+                        "那些", "有些", "為何", "到底", "多少", "一些", "很多", "這麼", "這麼", "的話", "不會", "不能", "不要", "完全", "https"
+                    }
+                    filtered = [w for w in words if w.strip() not in stopwords and len(w) > 1]
+                    
+                    if len(filtered) > 0:
+                        font_p = get_windows_font()
+                        try:
+                            bg_color = "#1e1e1e" if st.get_option("theme.base") == "dark" else "white"
+                            wc_args = {"background_color": bg_color, "width": 1000, "height": 450}
+                            if font_p: wc_args["font_path"] = font_p
+                                
+                            wc = WordCloud(**wc_args).generate(" ".join(filtered))
+                            fig_wc, ax = plt.subplots(figsize=(10, 4.5), facecolor=bg_color)
+                            ax.imshow(wc, interpolation='bilinear')
+                            ax.axis("off")
+                            st.pyplot(fig_wc)
+                        except:
+                            st.info("💡 詞雲生成發生字體相容性錯誤。")
+                    else:
+                        st.info("暫無足夠的關鍵字可以生成詞雲。")
+
+                with tab5:
+                    st.subheader("💬 擷取之原始留言列表")
+                    display_df = pd.DataFrame(all_comments)
+                    display_df.rename(columns={"date": "發布日期", "text": "留言內容"}, inplace=True)
+                    display_df = display_df[["發布日期", "留言內容"]]
+                    st.dataframe(display_df, use_container_width=True)
+
+# 當按鈕沒有被按下時，顯示歡迎畫面
 else:
     st.markdown("""
         <div class="welcome-card">
             <h1>👋 歡迎使用 AI YouTube 輿情分析系統</h1>
             <p style="font-size: 18px; opacity: 0.9;">
-                本系統結合了 YouTube Data API、SnowNLP 與 Groq Llama3，能高效爬取特定主題的社群留言，並自動產出脈絡摘要、觀點碰撞、情感分佈與動態時間軸趨勢。
+                本系統結合了 YouTube Data API、Hugging Face BERT 情感模型與 Groq Llama3，能高效爬取特定主題的社群留言，並自動產出脈絡摘要、觀點碰撞、情感分佈與動態時間軸趨勢。
             </p>
         </div>
         """, unsafe_allow_html=True)
